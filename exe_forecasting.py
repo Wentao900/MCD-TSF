@@ -26,6 +26,17 @@ parser.add_argument('--data_path', type=str, default='Economy/Economy.csv', help
 parser.add_argument('--seq_len', type=int, default=36, help='input sequence length')
 parser.add_argument('--pred_len', type=int, default=18, help='prediction sequence length')
 parser.add_argument('--text_len', type=int, default=36, help='context length in time series freq')
+parser.add_argument('--max_text_tokens', type=int, default=256, help='max tokens kept per text window after cleanup')
+parser.add_argument('--text_drop_prob', type=float, default=0.0, help='probability to drop text during training/eval for robustness')
+parser.add_argument('--use_rag_cot', action='store_true', help='enable retrieval-augmented CoT guidance text')
+parser.add_argument('--cot_only', action='store_true', help='disable retrieval; only generate CoT guidance text')
+parser.add_argument('--rag_topk', type=int, default=3, help='number of retrieved evidence snippets for RAG')
+parser.add_argument('--cot_model', type=str, default=None, help='local causal LM id/path for CoT generation (set None to use template)')
+parser.add_argument('--cot_max_new_tokens', type=int, default=96, help='max new tokens for CoT generator')
+parser.add_argument('--cot_temperature', type=float, default=0.7, help='sampling temperature for CoT generator')
+parser.add_argument('--cot_cache_size', type=int, default=1024, help='cache size for generated CoT strings')
+parser.add_argument('--cot_device', type=str, default=None, help='device for CoT generator, e.g., cuda:0 or cpu')
+parser.add_argument('--guide_w', type=float, default=-1, help='override guidance weight when cfg is enabled; negative to use default sweep')
 parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
 parser.add_argument('--freq', type=str, default='m', help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -38,6 +49,7 @@ parser.add_argument('--time_weight', type=float, default=0.1)
 parser.add_argument('--c_mask_prob', type=float, default=-1)
 parser.add_argument('--beta_end', type=float, default=-1)
 parser.add_argument('--lr', type=float, default=-1)
+parser.add_argument('--sample_steps_override', type=int, default=-1, help='override diffusion sample steps for fast testing')
 parser.add_argument('--save_attn', type=bool, default=False)
 parser.add_argument('--save_token', type=bool, default=False)
 
@@ -58,6 +70,7 @@ timestep_dim_dict = {
     'w': 2,
     'm': 1
 }
+extra_timestep_dims = 2 if args.data == 'custom' else 0
 context_dim_dict = {
     'bert': 768,
     'llama': 4096,
@@ -66,13 +79,24 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
+args.use_rag_cot = config["model"].get("use_rag_cot", args.use_rag_cot)
+args.cot_only = config["model"].get("cot_only", args.cot_only)
+if args.cot_only:
+    args.use_rag_cot = True
+    args.rag_topk = 0
+args.rag_topk = config["model"].get("rag_topk", args.rag_topk)
+args.cot_model = config["model"].get("cot_model", args.cot_model)
+args.cot_max_new_tokens = config["model"].get("cot_max_new_tokens", args.cot_max_new_tokens)
+args.cot_temperature = config["model"].get("cot_temperature", args.cot_temperature)
+args.cot_cache_size = config["model"].get("cot_cache_size", args.cot_cache_size)
+args.cot_device = config["model"].get("cot_device", args.cot_device)
 if args.embed == 'timeF':
     if config["model"]["timestep_branch"] or config["model"]["timestep_emb_cat"]:
-        config["model"]["timestep_dim"] = timestep_dim_dict[args.freq]
+        config["model"]["timestep_dim"] = timestep_dim_dict[args.freq] + extra_timestep_dims
     else:
         config["model"]["timestep_dim"] = 0
 else:
-    config["model"]["timestep_dim"] = 4
+    config["model"]["timestep_dim"] = 4 + extra_timestep_dims
 config["model"]["context_dim"] = context_dim_dict[config["model"]["llm"]] if config["model"]["with_texts"] else 0
 
 if args.datatype == 'electricity':
@@ -92,12 +116,24 @@ config["model"]["save_token"] = args.save_token
 config["diffusion"]["dropout"] = args.dropout
 config["diffusion"]["attn_drop"] = args.attn_drop
 config["diffusion"]["time_weight"] = args.time_weight
+config["model"]["rag_topk"] = config["model"].get("rag_topk", 1)
+config["model"]["cot_temperature"] = config["model"].get("cot_temperature", 0.55)
+config["model"]["use_rag_cot"] = args.use_rag_cot
+config["model"]["cot_only"] = args.cot_only
+config["model"]["rag_topk"] = args.rag_topk
+config["model"]["cot_model"] = args.cot_model
+config["model"]["cot_max_new_tokens"] = args.cot_max_new_tokens
+config["model"]["cot_temperature"] = args.cot_temperature
+config["model"]["cot_cache_size"] = args.cot_cache_size
+config["model"]["cot_device"] = args.cot_device
 
 if args.c_mask_prob > 0:
     config["diffusion"]["c_mask_prob"] = args.c_mask_prob
 
 if args.beta_end > 0:
     config["diffusion"]["beta_end"] = args.beta_end
+if args.sample_steps_override > 0:
+    config["diffusion"]["sample_steps"] = args.sample_steps_override
 
 if args.lr > 0:
     config["train"]["lr"] = args.lr
@@ -136,7 +172,8 @@ else:
 model.target_dim = target_dim
 if config["diffusion"]["cfg"]:
     best_mse = 10e10
-    for guide_w in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 5.0]:
+    guide_list = [args.guide_w] if args.guide_w >= 0 else [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 5.0]
+    for guide_w in guide_list:
         mse = evaluate(
             model,
             test_loader,

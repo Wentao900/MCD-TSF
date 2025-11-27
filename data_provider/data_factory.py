@@ -19,6 +19,18 @@ def data_provider(args, flag):
     drop_last = False if flag == 'test' else True
     batch_size = args.batch_size
     freq = args.freq
+    extra_kwargs = {'text_len': args.text_len}
+    if args.data == 'custom':
+        extra_kwargs['max_text_tokens'] = args.max_text_tokens
+        extra_kwargs['text_drop_prob'] = args.text_drop_prob
+        extra_kwargs['use_rag_cot'] = args.use_rag_cot
+        extra_kwargs['rag_topk'] = args.rag_topk
+        extra_kwargs['cot_model'] = args.cot_model
+        extra_kwargs['cot_max_new_tokens'] = args.cot_max_new_tokens
+        extra_kwargs['cot_temperature'] = args.cot_temperature
+        extra_kwargs['cot_cache_size'] = args.cot_cache_size
+        extra_kwargs['cot_device'] = args.cot_device
+        extra_kwargs['rag_use_retrieval'] = not args.cot_only
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,
@@ -28,7 +40,7 @@ def data_provider(args, flag):
         target=args.target,
         timeenc=timeenc,
         freq=freq,
-        text_len=args.text_len
+        **extra_kwargs
     )
     print(flag, len(data_set))
     data_loader = DataLoader(
@@ -38,4 +50,3 @@ def data_provider(args, flag):
         num_workers=args.num_workers,
         drop_last=drop_last)
     return data_set, data_loader
-

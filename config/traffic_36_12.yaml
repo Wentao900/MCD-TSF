@@ -2,8 +2,8 @@
 #type: args
 
 train:
-  epochs: 150
-  batch_size: 32
+  epochs: 20
+  batch_size: 8
   lr: 0.0001
   itr_per_epoch: 1.0e+8
 
@@ -21,9 +21,11 @@ diffusion:
   cfg: True
   c_mask_prob: 0.2
   ddim: True
-  sample_steps: 30
+  sample_steps: 120
   sample_method: "quad"
   pre_norm: False
+  # Recommended defaults after experiments
+  time_weight: 0.1
 
 model:
   is_unconditional: 0
@@ -38,3 +40,6 @@ model:
   decomp: False
   llm: "bert"
   llm_layers: 0
+  rag_topk: 1
+  cot_temperature: 0.55
+  guide_w_default: 1.2

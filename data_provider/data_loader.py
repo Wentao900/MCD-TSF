@@ -2,10 +2,47 @@ import os
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from utils.timefeatures import time_features
 import warnings
+from utils.timefeatures import time_features
+from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
 from utils.prepare4llm import get_desc
+
+try:
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler
+except ImportError:
+    class StandardScaler:  # minimal fallback
+        def fit(self, X):
+            self.mean_ = np.mean(X, axis=0, keepdims=True)
+            self.scale_ = np.std(X, axis=0, ddof=0, keepdims=True)
+            self.scale_[self.scale_ == 0] = 1.0
+            return self
+
+        def transform(self, X):
+            return (X - self.mean_) / self.scale_
+
+        def inverse_transform(self, X):
+            return X * self.scale_ + self.mean_
+
+    class MinMaxScaler:  # minimal fallback, feature_range=(-1, 1)
+        def __init__(self, feature_range=(-1, 1)):
+            self.feature_range = feature_range
+
+        def fit(self, X):
+            self.data_min_ = np.min(X, axis=0, keepdims=True)
+            self.data_max_ = np.max(X, axis=0, keepdims=True)
+            self.scale_ = self.data_max_ - self.data_min_
+            self.scale_[self.scale_ == 0] = 1.0
+            return self
+
+        def transform(self, X):
+            min_a, max_a = self.feature_range
+            norm = (X - self.data_min_) / self.scale_
+            return norm * (max_a - min_a) + min_a
+
+        def inverse_transform(self, X):
+            min_a, max_a = self.feature_range
+            norm = (X - min_a) / (max_a - min_a)
+            return norm * self.scale_ + self.data_min_
 
 warnings.filterwarnings('ignore')
 
@@ -13,7 +50,11 @@ class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h',
-                 text_len=1, scaler_type='standard'):
+                 text_len=1, scaler_type='standard',
+                 max_text_tokens=256, text_drop_prob=0.0,
+                 use_rag_cot=False, rag_topk=3, cot_model=None,
+                 cot_max_new_tokens=96, cot_temperature=0.7,
+                 cot_cache_size=1024, cot_device=None, rag_use_retrieval=True):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -33,6 +74,17 @@ class Dataset_Custom(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.text_len = text_len
+        self.max_text_tokens = max_text_tokens
+        self.text_drop_prob = text_drop_prob
+        self.use_rag_cot = use_rag_cot
+        self.rag_topk = rag_topk
+        self.cot_model = cot_model
+        self.cot_max_new_tokens = cot_max_new_tokens
+        self.cot_temperature = cot_temperature
+        self.cot_cache_size = cot_cache_size
+        self.cot_device = cot_device
+        self.rag_use_retrieval = rag_use_retrieval
+        self.guidance_cache = {}
 
         self.root_path = root_path
         self.data_path = data_path
@@ -53,6 +105,28 @@ class Dataset_Custom(Dataset):
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+        if self.use_rag_cot:
+            rag_cfg = RAGCoTConfig(
+                top_k=self.rag_topk,
+                max_new_tokens=self.cot_max_new_tokens,
+                temperature=self.cot_temperature,
+                cot_model=self.cot_model,
+                cache_size=self.cot_cache_size,
+                device=self.cot_device,
+                use_retrieval=self.rag_use_retrieval,
+                trust_remote_code=True if self.cot_model and ("qwen" in self.cot_model.lower()) else False,
+                load_in_8bit=True if self.cot_model and ("qwen" in self.cot_model.lower()) else False,
+            )
+            self.rag_cot = RAGCoTPipeline(
+                domain=self.domain,
+                search_df=self.search_df,
+                desc=self.desc,
+                lookback_len=self.seq_len,
+                pred_len=self.pred_len,
+                config=rag_cfg,
+            )
+        else:
+            self.rag_cot = None
         
 
     def __read_data__(self):
@@ -66,9 +140,11 @@ class Dataset_Custom(Dataset):
 
         df_num['date'], df_num['start_date'], df_num['end_date'] = pd.to_datetime(df_num['date']), pd.to_datetime(df_num['start_date']), pd.to_datetime(df_num['end_date'])
         df_report['start_date'], df_report['end_date'] = pd.to_datetime(df_report['start_date']), pd.to_datetime(df_report['end_date'])
+        df_search['start_date'], df_search['end_date'] = pd.to_datetime(df_search['start_date']), pd.to_datetime(df_search['end_date'])
 
         df_num = df_num.sort_values('date', ascending=True).reset_index(drop=True)
         df_report = df_report.sort_values('start_date', ascending=True).reset_index(drop=True)
+        df_search = df_search.sort_values('start_date', ascending=True).reset_index(drop=True)
         num_train = int(len(df_num) * 0.7)
         num_test = int(len(df_num) * 0.2)
         num_vali = len(df_num) - num_train - num_test
@@ -98,10 +174,15 @@ class Dataset_Custom(Dataset):
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
             df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
+            df_stamp['is_weekend'] = df_stamp.weekday.apply(lambda row: 1 if row >= 5 else 0, 1)
+            df_stamp['is_month_end'] = df_stamp.date.apply(lambda row: 1 if row.is_month_end else 0, 1)
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
+            weekend_flag = (df_stamp.date.dt.weekday >= 5).astype(np.float32).values.reshape(-1, 1)
+            month_end_flag = df_stamp.date.dt.is_month_end.astype(np.float32).values.reshape(-1, 1)
+            data_stamp = np.concatenate([data_stamp, weekend_flag, month_end_flag], axis=1)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
@@ -110,6 +191,7 @@ class Dataset_Custom(Dataset):
         self.data_stamp = data_stamp
         self.num_dates = df_num[['start_date', 'end_date']][border1:border2].reset_index(drop=True)
         self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
+        self.search_df = df_search[['start_date', 'end_date', 'fact']]
 
     def collect_text(self, start_date, end_date):
         report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
@@ -122,7 +204,19 @@ class Dataset_Custom(Dataset):
         else:
             report = ['NA']
             text_mark = 0
-        all_txt = ' '.join(report)
+        # deduplicate while keeping order
+        seen = set()
+        filtered_report = []
+        for segment in report:
+            if segment not in seen:
+                filtered_report.append(segment)
+                seen.add(segment)
+        all_txt = ' '.join(filtered_report)
+        # basic cleanup and truncation for robustness
+        tokens = all_txt.split()
+        if len(tokens) > self.max_text_tokens:
+            tokens = tokens[:self.max_text_tokens]
+        all_txt = ' '.join(tokens)
         return all_txt, text_mark
     
     def __getitem__(self, index):
@@ -142,6 +236,29 @@ class Dataset_Custom(Dataset):
         text_end = s_end
 
         seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        text_dropped = False
+        if (self.text_drop_prob > 0) and (np.random.rand() < self.text_drop_prob):
+            seq_x_txt, txt_mark = 'NA', 0
+            text_dropped = True
+        rag_retrieved, cot_text = '', ''
+        if self.use_rag_cot and self.rag_cot is not None and not text_dropped:
+            cached = self.guidance_cache.get(index, None)
+            if cached is None:
+                guidance = self.rag_cot.build_guidance_text(
+                    numeric_history=seq_x,
+                    start_date=self.num_dates.start_date[text_begin],
+                    end_date=self.num_dates.end_date[text_end - 1],
+                    base_text=seq_x_txt,
+                )
+                seq_x_txt = guidance["composed_text"]
+                cot_text = guidance["cot_text"]
+                rag_retrieved = guidance["retrieved_text"]
+                txt_mark = 1 if len(seq_x_txt.strip()) > 0 else 0
+                self.guidance_cache[index] = (seq_x_txt, txt_mark, cot_text, rag_retrieved)
+            else:
+                seq_x_txt, txt_mark, cot_text, rag_retrieved = cached
+        if len(seq_x_txt.strip()) == 0 or seq_x_txt == 'NA':
+            txt_mark = 0
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -156,7 +273,9 @@ class Dataset_Custom(Dataset):
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
             'texts': seq_x_txt,
-            'text_mark': txt_mark
+            'text_mark': txt_mark,
+            'cot_text': cot_text,
+            'retrieved_text': rag_retrieved
         }
 
         return s
