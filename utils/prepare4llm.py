@@ -3,6 +3,34 @@ from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GP
 import transformers
 
 
+def _load_model_with_fallback(model_cls, model_name, config):
+    attempts = [
+        {"local_files_only": True},
+        {"local_files_only": True, "use_safetensors": False},
+        {"local_files_only": False, "use_safetensors": False},
+        {"local_files_only": False},
+    ]
+    last_error = None
+    for kwargs in attempts:
+        try:
+            if kwargs["local_files_only"]:
+                print(f"Loading {model_name} from local cache...")
+            else:
+                print(f"Local model files not found or invalid. Attempting to download {model_name}...")
+            return model_cls.from_pretrained(model_name, config=config, **kwargs)
+        except Exception as exc:
+            last_error = exc
+    raise last_error
+
+
+def _load_tokenizer_with_fallback(tokenizer_cls, tokenizer_name):
+    try:
+        return tokenizer_cls.from_pretrained(tokenizer_name, local_files_only=True)
+    except Exception:
+        print(f"Local tokenizer files not found or invalid. Attempting to download {tokenizer_name}...")
+        return tokenizer_cls.from_pretrained(tokenizer_name, local_files_only=False)
+
+
 def get_desc(domain, lookback_len, pred_len):
     
     description = {
@@ -31,98 +59,24 @@ def get_llm(llm_model:str, llm_layers:int=0):
             llama_config.num_hidden_layers = llm_layers
         llama_config.output_attentions = True
         llama_config.output_hidden_states = True
-        try:
-            llm_model = LlamaModel.from_pretrained(
-                # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/",
-                'huggyllama/llama-7b',
-                local_files_only=True,
-                config=llama_config,
-                # load_in_4bit=True
-            )
-        except EnvironmentError:  # downloads model from HF is not already done
-            print("Local model files not found. Attempting to download...")
-            llm_model = LlamaModel.from_pretrained(
-                # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/",
-                'huggyllama/llama-7b',
-                local_files_only=False,
-                config=llama_config,
-                # load_in_4bit=True
-            )
-        try:
-            tokenizer = LlamaTokenizer.from_pretrained(
-                # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/tokenizer.model",
-                'huggyllama/llama-7b',
-                local_files_only=True
-            )
-        except EnvironmentError:  # downloads the tokenizer from HF if not already done
-            print("Local tokenizer files not found. Atempting to download them..")
-            tokenizer = LlamaTokenizer.from_pretrained(
-                # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/tokenizer.model",
-                'huggyllama/llama-7b',
-                local_files_only=False
-            )
+        llm_model = _load_model_with_fallback(LlamaModel, 'huggyllama/llama-7b', llama_config)
+        tokenizer = _load_tokenizer_with_fallback(LlamaTokenizer, 'huggyllama/llama-7b')
     elif llm_model == 'gpt2':
         gpt2_config = GPT2Config.from_pretrained('../llms/gpt2')
         if llm_layers:
             gpt2_config.num_hidden_layers = llm_layers
         gpt2_config.output_attentions = True
         gpt2_config.output_hidden_states = True
-        try:
-            llm_model = GPT2Model.from_pretrained(
-                'openai-community/gpt2',
-                local_files_only=True,
-                config=gpt2_config,
-            )
-        except EnvironmentError:  # downloads model from HF is not already done
-            print("Local model files not found. Attempting to download...")
-            llm_model = GPT2Model.from_pretrained(
-                'openai-community/gpt2',
-                local_files_only=False,
-                config=gpt2_config,
-            )
-
-        try:
-            tokenizer = GPT2Tokenizer.from_pretrained(
-                'openai-community/gpt2',
-                local_files_only=True
-            )
-        except EnvironmentError:  # downloads the tokenizer from HF if not already done
-            print("Local tokenizer files not found. Atempting to download them..")
-            tokenizer = GPT2Tokenizer.from_pretrained(
-                'openai-community/gpt2',
-                local_files_only=False
-            )
+        llm_model = _load_model_with_fallback(GPT2Model, 'openai-community/gpt2', gpt2_config)
+        tokenizer = _load_tokenizer_with_fallback(GPT2Tokenizer, 'openai-community/gpt2')
     elif llm_model == 'bert':
         bert_config = BertConfig.from_pretrained('google-bert/bert-base-uncased')
         if llm_layers:
             bert_config.num_hidden_layers = llm_layers
         bert_config.output_attentions = True
         bert_config.output_hidden_states = True
-        try:
-            llm_model = BertModel.from_pretrained(
-                'google-bert/bert-base-uncased',
-                local_files_only=True,
-                config=bert_config,
-            )
-        except EnvironmentError:  # downloads model from HF is not already done
-            print("Local model files not found. Attempting to download...")
-            llm_model = BertModel.from_pretrained(
-                'google-bert/bert-base-uncased',
-                local_files_only=False,
-                config=bert_config,
-            )
-
-        try:
-            tokenizer = BertTokenizer.from_pretrained(
-                'google-bert/bert-base-uncased',
-                local_files_only=True
-            )
-        except EnvironmentError:  # downloads the tokenizer from HF if not already done
-            print("Local tokenizer files not found. Atempting to download them..")
-            tokenizer = BertTokenizer.from_pretrained(
-                'google-bert/bert-base-uncased',
-                local_files_only=False
-            )
+        llm_model = _load_model_with_fallback(BertModel, 'google-bert/bert-base-uncased', bert_config)
+        tokenizer = _load_tokenizer_with_fallback(BertTokenizer, 'google-bert/bert-base-uncased')
     else:
         raise Exception('LLM model is not defined')
     return llm_model, tokenizer
