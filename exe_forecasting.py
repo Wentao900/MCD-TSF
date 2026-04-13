@@ -11,6 +11,11 @@ from main_model import CSDI_Forecasting
 from dataset_forecasting import get_dataloader
 from utils.utils import train, evaluate
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    return value.lower() in ("true", "1", "yes", "y")
+
 parser = argparse.ArgumentParser(description="MCD-TSF")
 parser.add_argument("--config", type=str, default="economy_36_18.yaml")
 parser.add_argument("--datatype", type=str, default="multimodal")
@@ -40,6 +45,24 @@ parser.add_argument('--beta_end', type=float, default=-1)
 parser.add_argument('--lr', type=float, default=-1)
 parser.add_argument('--save_attn', type=bool, default=False)
 parser.add_argument('--save_token', type=bool, default=False)
+parser.add_argument('--use_scale_rag_cot', action='store_true')
+parser.add_argument('--cot_model_name', type=str, default='gpt2-medium')
+parser.add_argument('--cot_local_files_only', type=str2bool, default=True)
+parser.add_argument('--cot_max_new_tokens', type=int, default=64)
+parser.add_argument('--rag_stage1_topk', type=int, default=12)
+parser.add_argument('--rag_stage2_topk', type=int, default=3)
+parser.add_argument('--use_longformer_rerank', action='store_true')
+parser.add_argument('--longformer_model_name', type=str, default='allenai/longformer-base-4096')
+parser.add_argument('--longformer_local_files_only', type=str2bool, default=True)
+parser.add_argument('--longformer_max_length', type=int, default=2048)
+parser.add_argument('--rag_long_topn', type=int, default=24)
+parser.add_argument('--rag_cache_guidance', type=str2bool, default=True)
+parser.add_argument('--use_scale_router', action='store_true')
+parser.add_argument('--scale_router_aux_weight', type=float, default=0.05)
+parser.add_argument('--scale_guidance_alpha', type=float, default=0.5)
+parser.add_argument('--scale_guidance_min', type=float, default=0.5)
+parser.add_argument('--scale_guidance_max', type=float, default=1.5)
+parser.add_argument('--text_max_length', type=int, default=512)
 
 
 args = parser.parse_args()
@@ -89,9 +112,32 @@ config["model"]["domain"] = args.data_path.split('/')[0]
 config["model"]["text_len"] = args.text_len
 config["model"]["save_attn"] = args.save_attn
 config["model"]["save_token"] = args.save_token
+config["model"]["text_max_length"] = args.text_max_length
+config["model"]["use_scale_router"] = args.use_scale_router
+config["model"]["scale_router_aux_weight"] = args.scale_router_aux_weight
+config["model"]["scale_guidance_alpha"] = args.scale_guidance_alpha
+config["model"]["scale_guidance_min"] = args.scale_guidance_min
+config["model"]["scale_guidance_max"] = args.scale_guidance_max
 config["diffusion"]["dropout"] = args.dropout
 config["diffusion"]["attn_drop"] = args.attn_drop
 config["diffusion"]["time_weight"] = args.time_weight
+config["rag_cot"] = {
+    "use_scale_rag_cot": args.use_scale_rag_cot,
+    "cot_model_name": args.cot_model_name,
+    "cot_local_files_only": args.cot_local_files_only,
+    "cot_max_new_tokens": args.cot_max_new_tokens,
+    "rag_stage1_topk": args.rag_stage1_topk,
+    "rag_stage2_topk": args.rag_stage2_topk,
+    "use_longformer_rerank": args.use_longformer_rerank,
+    "longformer_model_name": args.longformer_model_name,
+    "longformer_local_files_only": args.longformer_local_files_only,
+    "longformer_max_length": args.longformer_max_length,
+    "rag_long_topn": args.rag_long_topn,
+    "rag_cache_guidance": args.rag_cache_guidance,
+}
+
+if args.use_scale_rag_cot:
+    args.num_workers = 0
 
 if args.c_mask_prob > 0:
     config["diffusion"]["c_mask_prob"] = args.c_mask_prob

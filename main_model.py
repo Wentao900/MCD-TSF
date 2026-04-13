@@ -88,6 +88,13 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.text_max_length = int(config["model"].get("text_max_length", 512))
+        self.use_scale_router = bool(config["model"].get("use_scale_router", False))
+        self.scale_router_aux_weight = float(config["model"].get("scale_router_aux_weight", 0.05))
+        self.scale_guidance_alpha = float(config["model"].get("scale_guidance_alpha", 0.5))
+        self.scale_guidance_min = float(config["model"].get("scale_guidance_min", 0.5))
+        self.scale_guidance_max = float(config["model"].get("scale_guidance_max", 1.5))
+        self.num_scale_bands = max(1, min(3, self.pred_len))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -126,6 +133,15 @@ class CSDI_base(nn.Module):
                     pad_token = '[PAD]'
                     self.tokenizer.add_special_tokens({'pad_token': pad_token})
                     self.tokenizer.pad_token = pad_token
+
+        if self.use_scale_router:
+            router_input_dim = 5 + (self.context_dim if self.with_texts else 0)
+            router_hidden_dim = max(16, min(128, router_input_dim))
+            self.scale_router = nn.Sequential(
+                nn.Linear(router_input_dim, router_hidden_dim),
+                nn.GELU(),
+                nn.Linear(router_hidden_dim, self.num_scale_bands),
+            )
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
@@ -170,6 +186,80 @@ class CSDI_base(nn.Module):
         pe[:, :, 0::2] = torch.sin(position * div_term)
         pe[:, :, 1::2] = torch.cos(position * div_term)
         return pe
+
+    def get_scale_router_probs(self, observed_data, context=None):
+        if not self.use_scale_router:
+            return None
+
+        history = observed_data[:, :, :self.lookback_len]
+        first = history[:, :, 0].mean(dim=1, keepdim=True)
+        last = history[:, :, -1].mean(dim=1, keepdim=True)
+        slope = (last - first) / max(1, self.lookback_len - 1)
+        mean = history.mean(dim=(1, 2), keepdim=False).unsqueeze(1)
+        std = history.std(dim=(1, 2), unbiased=False, keepdim=False).unsqueeze(1)
+        if self.lookback_len > 1:
+            change_mean = torch.abs(history[:, :, 1:] - history[:, :, :-1]).mean(dim=(1, 2), keepdim=False).unsqueeze(1)
+        else:
+            change_mean = torch.zeros_like(mean)
+        numeric_features = torch.cat([first, last, slope, mean, std + change_mean], dim=1)
+
+        if self.with_texts:
+            if context is None:
+                text_features = torch.zeros(
+                    observed_data.shape[0],
+                    self.context_dim,
+                    device=observed_data.device,
+                    dtype=observed_data.dtype,
+                )
+            else:
+                text_features = context.mean(dim=2)
+            router_input = torch.cat([numeric_features, text_features], dim=1)
+        else:
+            router_input = numeric_features
+        return torch.softmax(self.scale_router(router_input), dim=-1)
+
+    def get_scale_router_guidance(self, router_probs, guide_w):
+        if router_probs is None:
+            return guide_w
+        band_midpoints = torch.linspace(
+            0.0,
+            1.0,
+            steps=self.num_scale_bands + 1,
+            device=router_probs.device,
+            dtype=router_probs.dtype,
+        )
+        band_midpoints = (band_midpoints[:-1] + band_midpoints[1:]) / 2.0
+        sigma = torch.sum(router_probs * band_midpoints.unsqueeze(0), dim=1)
+        scale = torch.clamp(
+            1 + self.scale_guidance_alpha * (sigma - 0.5),
+            self.scale_guidance_min,
+            self.scale_guidance_max,
+        )
+        return guide_w * scale.view(-1, 1, 1)
+
+    def get_scale_router_target(self, observed_data):
+        history = observed_data[:, :, :self.lookback_len].detach()
+        first = history[:, :, 0].mean(dim=1)
+        last = history[:, :, -1].mean(dim=1)
+        slope = torch.abs((last - first) / max(1, self.lookback_len - 1))
+        if self.lookback_len > 1:
+            change_mean = torch.abs(history[:, :, 1:] - history[:, :, :-1]).mean(dim=(1, 2))
+        else:
+            change_mean = torch.zeros_like(slope)
+        volatility = history.std(dim=(1, 2), unbiased=False)
+        long_score = slope
+        short_score = volatility + change_mean
+        mid_score = torch.ones_like(short_score) * (short_score.mean().detach() + long_score.mean().detach() + 1e-3)
+        scores = torch.stack([short_score, mid_score, long_score], dim=1)
+        scores = scores[:, :self.num_scale_bands]
+        return torch.softmax(scores.detach(), dim=-1)
+
+    def get_scale_router_aux_loss(self, observed_data, router_probs):
+        if router_probs is None or self.scale_router_aux_weight <= 0:
+            return observed_data.sum() * 0.0
+        target = self.get_scale_router_target(observed_data)
+        log_probs = torch.log(router_probs.clamp_min(1e-6))
+        return torch.nn.functional.kl_div(log_probs, target, reduction="batchmean")
 
     def get_randmask(self, observed_mask):
         rand_for_mask = torch.rand_like(observed_mask) * observed_mask
@@ -221,18 +311,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, router_probs=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, router_probs=router_probs
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, router_probs=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -277,6 +367,9 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        if router_probs is not None:
+            aux_loss = self.get_scale_router_aux_loss(observed_data, router_probs)
+            loss = loss + self.scale_router_aux_weight * aux_loss
         return loss
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
@@ -297,7 +390,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, router_probs=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -317,6 +410,7 @@ class CSDI_base(nn.Module):
             observed_data = (observed_data - means) / stdev
         
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
+        scale_guide_w = self.get_scale_router_guidance(router_probs, guide_w) if self.cfg else guide_w
         if self.cfg:
             side_info = side_info.repeat(2, 1, 1, 1)
             if timestep_emb is not None:
@@ -368,7 +462,7 @@ class CSDI_base(nn.Module):
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                 if self.cfg:
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
-                    predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                    predicted = predicted_uncond + scale_guide_w * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -551,6 +645,7 @@ class CSDI_Forecasting(CSDI_base):
         token_input = self.tokenizer(text,
                                      padding='max_length',
                                      truncation=True,
+                                     max_length=self.text_max_length,
                                      return_tensors='pt',
                                      ).to(self.device)
         context = self.text_encoder(**token_input).last_hidden_state
@@ -632,10 +727,11 @@ class CSDI_Forecasting(CSDI_base):
                 context = self.get_text_info(texts, text_mask)
         else:
             context = None
+        router_probs = self.get_scale_router_probs(observed_data, context)
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, router_probs=router_probs)
 
     def evaluate(self, batch, n_samples, guide_w):
         (
@@ -674,10 +770,11 @@ class CSDI_Forecasting(CSDI_base):
                     context = self.get_text_info(texts, text_mask)
             else:
                 context = None
+            router_probs = self.get_scale_router_probs(observed_data, context)
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, router_probs=router_probs)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, router_probs=router_probs)
 
         if self.save_attn:
             if self.save_token:
