@@ -18,6 +18,7 @@ class Dataset_Custom(Dataset):
                  use_scale_rag_cot=False, cot_model_name='gpt2-medium',
                  cot_local_files_only=True, cot_max_new_tokens=64,
                  rag_stage1_topk=12, rag_stage2_topk=3,
+                 use_gpt2_rerank=False, gpt2_rerank_max_length=512,
                  use_longformer_rerank=False, longformer_model_name='allenai/longformer-base-4096',
                  longformer_local_files_only=True, longformer_max_length=2048,
                  rag_long_topn=24, rag_cache_guidance=True):
@@ -46,6 +47,8 @@ class Dataset_Custom(Dataset):
         self.cot_max_new_tokens = cot_max_new_tokens
         self.rag_stage1_topk = rag_stage1_topk
         self.rag_stage2_topk = rag_stage2_topk
+        self.use_gpt2_rerank = use_gpt2_rerank
+        self.gpt2_rerank_max_length = gpt2_rerank_max_length
         self.use_longformer_rerank = use_longformer_rerank
         self.longformer_model_name = longformer_model_name
         self.longformer_local_files_only = longformer_local_files_only
@@ -81,6 +84,8 @@ class Dataset_Custom(Dataset):
                 cot_model_name=self.cot_model_name,
                 cot_local_files_only=self.cot_local_files_only,
                 cot_max_new_tokens=self.cot_max_new_tokens,
+                use_gpt2_rerank=self.use_gpt2_rerank,
+                gpt2_rerank_max_length=self.gpt2_rerank_max_length,
                 use_longformer_rerank=self.use_longformer_rerank,
                 longformer_model_name=self.longformer_model_name,
                 longformer_local_files_only=self.longformer_local_files_only,

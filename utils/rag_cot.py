@@ -39,6 +39,8 @@ class ScaleAwareRAGCoT:
         cot_model_name="gpt2-medium",
         cot_local_files_only=True,
         cot_max_new_tokens=64,
+        use_gpt2_rerank=False,
+        gpt2_rerank_max_length=512,
         use_longformer_rerank=False,
         longformer_model_name="allenai/longformer-base-4096",
         longformer_local_files_only=True,
@@ -60,6 +62,8 @@ class ScaleAwareRAGCoT:
         self._cot_model = None
         self._cot_tokenizer = None
         self._cot_load_failed = False
+        self.use_gpt2_rerank = bool(use_gpt2_rerank)
+        self.gpt2_rerank_max_length = max(128, int(gpt2_rerank_max_length))
 
         self.use_longformer_rerank = bool(use_longformer_rerank)
         self.longformer_model_name = longformer_model_name
@@ -168,6 +172,75 @@ class ScaleAwareRAGCoT:
             return [evidence[idx] for idx in indices]
         except Exception:
             return evidence[:topk]
+
+    def _gpt2_rerank(self, query, evidence, topk):
+        if not evidence or not self.use_gpt2_rerank or not self._load_cot_model():
+            return evidence[:topk]
+        try:
+            import torch
+
+            query_short = str(query or "")[:600]
+            prefixes = [
+                f"Forecast context:\n{query_short}\nRelevant evidence:\n"
+                for _ in evidence
+            ]
+            texts = [
+                f"{prefix}{str(item)[:600]}"
+                for prefix, item in zip(prefixes, evidence)
+            ]
+            token_input = self._cot_tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.gpt2_rerank_max_length,
+                return_tensors="pt",
+            )
+            prefix_lengths = [
+                len(self._cot_tokenizer(
+                    prefix,
+                    truncation=True,
+                    max_length=self.gpt2_rerank_max_length,
+                )["input_ids"])
+                for prefix in prefixes
+            ]
+            labels = token_input["input_ids"].clone()
+            for row_idx, prefix_len in enumerate(prefix_lengths):
+                labels[row_idx, :prefix_len] = -100
+            labels[token_input["attention_mask"] == 0] = -100
+
+            model_device = next(self._cot_model.parameters()).device
+            token_input = {key: value.to(model_device) for key, value in token_input.items()}
+            labels = labels.to(model_device)
+            with torch.no_grad():
+                logits = self._cot_model(**token_input).logits
+
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+            token_losses = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ).view(shift_labels.size())
+            valid_mask = shift_labels.ne(-100)
+            valid_counts = valid_mask.sum(dim=1)
+            if valid_counts.eq(0).all():
+                return evidence[:topk]
+            sample_losses = (token_losses * valid_mask).sum(dim=1) / valid_counts.clamp_min(1)
+            sample_losses = torch.where(
+                valid_counts.gt(0),
+                sample_losses,
+                torch.full_like(sample_losses, float("inf")),
+            )
+            scores = -sample_losses
+            indices = torch.argsort(scores, descending=True)[:topk].tolist()
+            return [evidence[idx] for idx in indices]
+        except Exception:
+            return evidence[:topk]
+
+    def _rerank(self, query, evidence, topk):
+        if self.use_gpt2_rerank:
+            return self._gpt2_rerank(query, evidence, topk)
+        return self._longformer_rerank(query, evidence, topk)
 
     def _summarize_num(self, history_values):
         if np is None:
@@ -314,7 +387,7 @@ class ScaleAwareRAGCoT:
 
         query1 = "\n".join(part for part in [desc, raw_text_short, "[NUMERICAL SUMMARY]", num_summary] if part)
         evidence0 = self._retrieve(query1, self.rag_long_topn, corpus)
-        evidence0 = self._longformer_rerank(query1, evidence0, self.rag_stage1_topk)
+        evidence0 = self._rerank(query1, evidence0, self.rag_stage1_topk)
 
         cot_prompt = (
             "Generate a short forecasting trend hypothesis.\n"
@@ -330,7 +403,7 @@ class ScaleAwareRAGCoT:
             "Retrieve evidence that best supports or explains this trend hypothesis."
         )
         evidence1 = self._retrieve(query2, self.rag_long_topn, corpus)
-        evidence1 = self._longformer_rerank(query2, evidence1, self.rag_stage2_topk) or evidence0[: self.rag_stage2_topk]
+        evidence1 = self._rerank(query2, evidence1, self.rag_stage2_topk) or evidence0[: self.rag_stage2_topk]
         evidence_text = "\n".join(f"{idx + 1}) {text[:350]}" for idx, text in enumerate(evidence1)) or "NA"
 
         return (

@@ -51,6 +51,8 @@ parser.add_argument('--cot_local_files_only', type=str2bool, default=True)
 parser.add_argument('--cot_max_new_tokens', type=int, default=64)
 parser.add_argument('--rag_stage1_topk', type=int, default=12)
 parser.add_argument('--rag_stage2_topk', type=int, default=3)
+parser.add_argument('--use_gpt2_rerank', action='store_true')
+parser.add_argument('--gpt2_rerank_max_length', type=int, default=512)
 parser.add_argument('--use_longformer_rerank', action='store_true')
 parser.add_argument('--longformer_model_name', type=str, default='allenai/longformer-base-4096')
 parser.add_argument('--longformer_local_files_only', type=str2bool, default=True)
@@ -128,6 +130,8 @@ config["rag_cot"] = {
     "cot_max_new_tokens": args.cot_max_new_tokens,
     "rag_stage1_topk": args.rag_stage1_topk,
     "rag_stage2_topk": args.rag_stage2_topk,
+    "use_gpt2_rerank": args.use_gpt2_rerank,
+    "gpt2_rerank_max_length": args.gpt2_rerank_max_length,
     "use_longformer_rerank": args.use_longformer_rerank,
     "longformer_model_name": args.longformer_model_name,
     "longformer_local_files_only": args.longformer_local_files_only,
