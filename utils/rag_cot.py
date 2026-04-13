@@ -1,4 +1,5 @@
 import math
+import os
 import re
 
 try:
@@ -12,6 +13,21 @@ try:
 except Exception:
     TfidfVectorizer = None
     cosine_similarity = None
+
+
+def resolve_local_model_path(model_name, aliases=()):
+    candidates = [model_name, model_name.split("/")[-1], model_name.replace("/", "--")]
+    candidates.extend(aliases)
+    roots = [os.getcwd(), os.path.join(os.getcwd(), "llms"), os.path.join(os.getcwd(), "models")]
+    for root in roots:
+        for candidate in candidates:
+            path = os.path.join(root, candidate)
+            if os.path.isdir(path):
+                return path
+    raise FileNotFoundError(
+        f"Local model files for {model_name} were not found under current directory, ./llms, or ./models. "
+        f"Checked names: {', '.join(candidates)}"
+    )
 
 
 class ScaleAwareRAGCoT:
@@ -107,13 +123,17 @@ class ScaleAwareRAGCoT:
         try:
             from transformers import AutoModel, AutoTokenizer
 
-            self._longformer_tokenizer = AutoTokenizer.from_pretrained(
+            model_path = resolve_local_model_path(
                 self.longformer_model_name,
-                local_files_only=self.longformer_local_files_only,
+                aliases=("longformer-base-4096",),
+            )
+            self._longformer_tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                local_files_only=True,
             )
             self._longformer_model = AutoModel.from_pretrained(
-                self.longformer_model_name,
-                local_files_only=self.longformer_local_files_only,
+                model_path,
+                local_files_only=True,
             )
             self._longformer_model.eval()
             return True
@@ -236,13 +256,17 @@ class ScaleAwareRAGCoT:
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            self._cot_tokenizer = AutoTokenizer.from_pretrained(
+            model_path = resolve_local_model_path(
                 self.cot_model_name,
-                local_files_only=self.cot_local_files_only,
+                aliases=("gpt2-medium",),
+            )
+            self._cot_tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                local_files_only=True,
             )
             self._cot_model = AutoModelForCausalLM.from_pretrained(
-                self.cot_model_name,
-                local_files_only=self.cot_local_files_only,
+                model_path,
+                local_files_only=True,
             )
             if self._cot_tokenizer.pad_token is None:
                 self._cot_tokenizer.pad_token = self._cot_tokenizer.eos_token
