@@ -49,6 +49,7 @@ parser.add_argument('--use_scale_rag_cot', action='store_true')
 parser.add_argument('--cot_model_name', type=str, default='gpt2-medium')
 parser.add_argument('--cot_local_files_only', type=str2bool, default=True)
 parser.add_argument('--cot_max_new_tokens', type=int, default=64)
+parser.add_argument('--cot_device', type=str, default='auto')
 parser.add_argument('--rag_stage1_topk', type=int, default=12)
 parser.add_argument('--rag_stage2_topk', type=int, default=3)
 parser.add_argument('--use_gpt2_rerank', action='store_true')
@@ -128,6 +129,7 @@ config["rag_cot"] = {
     "cot_model_name": args.cot_model_name,
     "cot_local_files_only": args.cot_local_files_only,
     "cot_max_new_tokens": args.cot_max_new_tokens,
+    "cot_device": args.cot_device,
     "rag_stage1_topk": args.rag_stage1_topk,
     "rag_stage2_topk": args.rag_stage2_topk,
     "use_gpt2_rerank": args.use_gpt2_rerank,

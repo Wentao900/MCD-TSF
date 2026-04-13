@@ -36,6 +36,7 @@ def data_provider(args, flag):
             cot_model_name=getattr(args, "cot_model_name", "gpt2-medium"),
             cot_local_files_only=getattr(args, "cot_local_files_only", True),
             cot_max_new_tokens=getattr(args, "cot_max_new_tokens", 64),
+            cot_device=getattr(args, "cot_device", "auto"),
             rag_stage1_topk=getattr(args, "rag_stage1_topk", 12),
             rag_stage2_topk=getattr(args, "rag_stage2_topk", 3),
             use_gpt2_rerank=getattr(args, "use_gpt2_rerank", False),

@@ -1,4 +1,5 @@
 import os
+import time
 
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
     BertModel, BertTokenizer
@@ -34,8 +35,11 @@ def _load_model_local(model_cls, model_path, config):
     last_error = None
     for kwargs in attempts:
         try:
-            print(f"Loading local model from {model_path}...")
-            return model_cls.from_pretrained(model_path, config=config, **kwargs)
+            start_time = time.time()
+            print(f"Loading local model from {model_path}...", flush=True)
+            model = model_cls.from_pretrained(model_path, config=config, **kwargs)
+            print(f"Loaded local model from {model_path} in {time.time() - start_time:.2f}s.", flush=True)
+            return model
         except Exception as exc:
             last_error = exc
     raise last_error

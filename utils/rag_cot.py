@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import time
 
 try:
     import numpy as np
@@ -39,6 +40,7 @@ class ScaleAwareRAGCoT:
         cot_model_name="gpt2-medium",
         cot_local_files_only=True,
         cot_max_new_tokens=64,
+        cot_device="auto",
         use_gpt2_rerank=False,
         gpt2_rerank_max_length=512,
         use_longformer_rerank=False,
@@ -58,6 +60,7 @@ class ScaleAwareRAGCoT:
         self.cot_model_name = cot_model_name
         self.cot_local_files_only = bool(cot_local_files_only)
         self.cot_max_new_tokens = max(1, int(cot_max_new_tokens))
+        self.cot_device = cot_device
         self.cot_generator = cot_generator
         self._cot_model = None
         self._cot_tokenizer = None
@@ -333,6 +336,8 @@ class ScaleAwareRAGCoT:
                 self.cot_model_name,
                 aliases=("gpt2-medium",),
             )
+            start_time = time.time()
+            print(f"Loading local CoT GPT2 model from {model_path}...", flush=True)
             self._cot_tokenizer = AutoTokenizer.from_pretrained(
                 model_path,
                 local_files_only=True,
@@ -343,13 +348,31 @@ class ScaleAwareRAGCoT:
             )
             if self._cot_tokenizer.pad_token is None:
                 self._cot_tokenizer.pad_token = self._cot_tokenizer.eos_token
+            target_device = self._resolve_cot_device()
+            if target_device != "cpu":
+                self._cot_model.to(target_device)
             self._cot_model.eval()
+            print(
+                f"Loaded local CoT GPT2 model on {target_device} in {time.time() - start_time:.2f}s.",
+                flush=True,
+            )
             return True
-        except Exception:
+        except Exception as exc:
+            print(f"CoT GPT2 load failed, falling back to template CoT: {exc}", flush=True)
             self._cot_load_failed = True
             self._cot_model = None
             self._cot_tokenizer = None
             return False
+
+    def _resolve_cot_device(self):
+        if str(self.cot_device).lower() == "auto":
+            try:
+                import torch
+
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                return "cpu"
+        return str(self.cot_device)
 
     def _generate_cot(self, prompt, stats):
         if self.cot_generator is not None:
@@ -365,6 +388,8 @@ class ScaleAwareRAGCoT:
             import torch
 
             inputs = self._cot_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
+            model_device = next(self._cot_model.parameters()).device
+            inputs = {key: value.to(model_device) for key, value in inputs.items()}
             with torch.no_grad():
                 output_ids = self._cot_model.generate(
                     **inputs,
